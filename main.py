@@ -1,106 +1,518 @@
 from flask import Flask, request, jsonify
-import sqlite3
 from datetime import datetime
+import pandas as pd
+import os
+import mysql.connector
+from sklearn.ensemble import IsolationForest
+import google.generativeai as genai
 
 app = Flask(__name__)
 
+# ==========================================
+# CONFIG MYSQL RAILWAY
+# ==========================================
+
+db_config = {
+    "host": os.getenv("MYSQLHOST"),
+    "user": os.getenv("MYSQLUSER"),
+    "password": os.getenv("MYSQLPASSWORD"),
+    "database": os.getenv("MYSQLDATABASE"),
+    "port": int(os.getenv("MYSQLPORT", 3306))
+}
+
+
+def db_connection():
+    return mysql.connector.connect(**db_config)
+
+
+# ==========================================
+# INITIALISATION DATABASE
+# ==========================================
+
 def init_db():
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS measurements (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        temperature REAL NOT NULL,
-        humidity REAL NOT NULL,
-        emergency INTEGER NOT NULL
-    )
-    """)
+    try:
 
-    conn.commit()
-    conn.close()
+        conn = db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS fuel_measurements(
+
+                id INT AUTO_INCREMENT PRIMARY KEY,
+
+                timestamp DATETIME,
+
+                device_id VARCHAR(50),
+
+                fuel_level FLOAT
+
+            )
+        """)
+
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        print("TABLE fuel_measurements OK", flush=True)
+
+    except Exception as e:
+
+        print("Erreur création table :", e, flush=True)
+
 
 init_db()
 
-def insert_data(timestamp, temperature, humidity, emergency):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO measurements (timestamp, temperature, humidity, emergency)
-        VALUES (?, ?, ?, ?)
-    """, (timestamp, temperature, humidity, emergency))
-
-    conn.commit()
-    conn.close()
-
-temperature = 0.0
-humidity = 0.0
-emergency = 0
+# ==========================================
+# ROUTE HOME
+# ==========================================
 
 @app.route("/")
 def home():
-    return "IoT API Alvin Running"
+    return "API IS WORKING"
+
+
+# ==========================================
+# TEST DATABASE
+# ==========================================
+
+@app.route("/test_db")
+def test_db():
+
+    try:
+
+        conn = db_connection()
+
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT 1")
+
+        result = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        return jsonify({
+            "status": "success",
+            "message": "Connexion SQL OK",
+            "result": result
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+# ==========================================
+# INSERT DATA
+# ==========================================
 
 @app.route("/data")
 def data():
-    global temperature, humidity, emergency
 
-    temperature = float(request.args.get("temp", 0))
-    humidity = float(request.args.get("hum", 0))
-    emergency = int(request.args.get("emergency", 0))
+    try:
 
-    log_entry = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "temperature": temperature,
-        "humidity": humidity,
-        "emergency": emergency
-    }
+        device_id = request.args.get(
+            "device_id",
+            "pico_001"
+        )
 
-    insert_data(
-        log_entry["timestamp"],
-        log_entry["temperature"],
-        log_entry["humidity"],
-        log_entry["emergency"]
-    )
+        fuel_level = request.args.get("fuel_level")
 
-    print("Données reçues :", log_entry, flush=True)
+        fuel_level = float(fuel_level)
 
-    return "OK", 200
+        conn = db_connection()
 
-@app.route("/status")
-def status():
-    return jsonify({
-        "temperature": temperature,
-        "humidity": humidity,
-        "emergency": emergency
-    })
+        cursor = conn.cursor()
 
-@app.route("/logs")
-def get_logs():
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO fuel_measurements(
+                timestamp,
+                device_id,
+                fuel_level
+            )
+            VALUES(%s,%s,%s)
+        """, (
 
-    cursor.execute("""
-        SELECT timestamp, temperature, humidity, emergency
-        FROM measurements
-        ORDER BY id DESC
-    """)
+            datetime.now(),
+            device_id,
+            fuel_level
 
-    rows = cursor.fetchall()
-    conn.close()
+        ))
 
-    logs = []
-    for row in rows:
-        logs.append({
-            "timestamp": row[0],
-            "temperature": row[1],
-            "humidity": row[2],
-            "emergency": row[3]
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        return jsonify({
+
+            "status": "success",
+
+            "device_id": device_id,
+
+            "fuel_level": fuel_level
+
         })
 
-    return jsonify(logs)
+    except Exception as e:
+
+        return jsonify({
+
+            "status": "error",
+
+            "message": str(e)
+
+        }), 500
+
+
+# ==========================================
+# LOGS
+# ==========================================
+
+@app.route("/logs")
+def logs():
+
+    try:
+
+        conn = db_connection()
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT *
+            FROM fuel_measurements
+            ORDER BY timestamp DESC
+            LIMIT 50
+        """)
+
+        data = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return jsonify(data)
+
+    except Exception as e:
+
+        return jsonify({
+
+            "status": "error",
+
+            "message": str(e)
+
+        }), 500
+
+
+# ==========================================
+# IA ANALYSE
+# ==========================================
+
+@app.route("/analyse")
+def analyse():
+
+    try:
+
+        conn = db_connection()
+
+        query = """
+            SELECT *
+            FROM fuel_measurements
+            ORDER BY timestamp
+            LIMIT 50
+        """
+
+        df = pd.read_sql(query, conn)
+
+        conn.close()
+
+        if len(df) < 5:
+
+            return jsonify({
+
+                "status": "error",
+
+                "message": "Pas assez de données"
+
+            }), 500
+
+        model = IsolationForest(
+
+            contamination=0.15,
+
+            random_state=42
+
+        )
+
+        df["anormaly"] = model.fit_predict(
+            df[["fuel_level"]]
+        )
+
+        resultat = []
+
+        for _, row in df.iterrows():
+
+            resultat.append({
+
+                "id": int(row["id"]),
+
+                "timestamp": str(row["timestamp"]),
+
+                "device_id": row["device_id"],
+
+                "fuel_level": float(row["fuel_level"]),
+
+                "status": "ANOMALIE"
+                if row["anormaly"] == -1
+                else "NORMAL"
+
+            })
+
+        return jsonify(resultat)
+
+    except Exception as e:
+
+        return jsonify({
+
+            "status": "error",
+
+            "message": str(e)
+
+        }), 500
+
+
+# ==========================================
+# IA GENERATIVE GEMINI
+# ==========================================
+
+@app.route("/ai_report")
+def ai_report():
+
+    try:
+
+        api_key = os.getenv("GEMINI_API_KEY")
+
+        if not api_key:
+
+            return jsonify({
+
+                "status": "error",
+
+                "message": "GEMINI_API_KEY manquante"
+
+            }), 500
+
+        genai.configure(api_key=api_key)
+
+        start_date = request.args.get("start_date")
+
+        end_date = request.args.get("end_date")
+
+        conn = db_connection()
+
+        # ==========================
+        # REQUETE SQL
+        # ==========================
+
+        if start_date and end_date:
+
+            query = """
+                SELECT *
+                FROM fuel_measurements
+                WHERE DATE(timestamp)
+                BETWEEN %s AND %s
+                ORDER BY timestamp ASC
+            """
+
+            df = pd.read_sql(
+                query,
+                conn,
+                params=(start_date, end_date)
+            )
+
+        else:
+
+            query = """
+                SELECT *
+                FROM fuel_measurements
+                ORDER BY timestamp ASC
+            """
+
+            df = pd.read_sql(query, conn)
+
+        conn.close()
+
+        # ==========================
+        # VERIFICATION DATA
+        # ==========================
+
+        if len(df) < 5:
+
+            return jsonify({
+
+                "status": "error",
+
+                "message": "Pas assez de données"
+
+            }), 500
+
+        # ==========================
+        # IA ISOLATION FOREST
+        # ==========================
+
+        model_iforest = IsolationForest(
+
+            contamination=0.15,
+
+            random_state=42
+
+        )
+
+        df["anormaly"] = model_iforest.fit_predict(
+            df[["fuel_level"]]
+        )
+
+        anomalies = df[
+            df["anormaly"] == -1
+        ]
+
+        # ==========================
+        # SI AUCUNE ANOMALIE
+        # ==========================
+
+        if anomalies.empty:
+
+            return jsonify({
+
+                "status": "success",
+
+                "report":
+                "Aucune anomalie détectée sur la période."
+
+            })
+
+        # ==========================
+        # CREATION TEXTE ANOMALIES
+        # ==========================
+
+        anomaly_text = ""
+
+        for _, row in anomalies.iterrows():
+
+            anomaly_text += f"""
+
+Horodatage : {row['timestamp']}
+
+Appareil : {row['device_id']}
+
+Niveau carburant : {row['fuel_level']} %
+
+-----------------------------------
+
+"""
+
+        # ==========================
+        # TEXTE PERIODE
+        # ==========================
+
+        if start_date and end_date:
+
+            periode_text = f"""
+Période analysée :
+du {start_date} au {end_date}
+"""
+
+        else:
+
+            periode_text = """
+Période analysée :
+toutes les données disponibles
+"""
+
+        # ==========================
+        # PROMPT GEMINI
+        # ==========================
+
+        prompt = f"""
+Tu es un assistant industriel spécialisé en IoT,
+supervision carburant,
+détection d'anomalies
+et maintenance intelligente.
+
+{periode_text}
+
+Voici les anomalies détectées :
+
+{anomaly_text}
+
+Rédige un rapport court en français
+avec cette structure :
+
+1. Résumé de la situation
+
+2. Interprétation possible
+
+3. Recommandation technique
+
+Le rapport doit être :
+- clair
+- professionnel
+- facile à comprendre
+"""
+
+        # ==========================
+        # GEMINI
+        # ==========================
+
+        model_gemini = genai.GenerativeModel(
+            "gemini-2.5-flash"
+        )
+
+        reponse = model_gemini.generate_content(
+            prompt
+        )
+
+        # ==========================
+        # RETOUR API
+        # ==========================
+
+        return jsonify({
+
+            "status": "success",
+
+            "start_date": start_date,
+
+            "end_date": end_date,
+
+            "report": reponse.text
+
+        })
+
+    except Exception as e:
+
+        return jsonify({
+
+            "status": "error",
+
+            "message": str(e)
+
+        }), 500
+
+
+# ==========================================
+# LANCEMENT APP
+# ==========================================
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+
+    app.run(
+
+        host="0.0.0.0",
+
+        port=int(os.getenv("PORT", 5000))
+
+    )
